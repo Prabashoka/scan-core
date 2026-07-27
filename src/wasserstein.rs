@@ -1,3 +1,12 @@
+/// Sort ascending under `f64::total_cmp`.
+///
+/// Every sort in this crate goes through here so that all callers agree on the
+/// ordering, including the placement of `-0.0` and NaN.
+#[inline]
+pub fn sort_f64(values: &mut [f64]) {
+    values.sort_unstable_by(f64::total_cmp);
+}
+
 /// General 1D Wasserstein distance between two empirical samples.
 ///
 /// This function works for both:
@@ -15,7 +24,6 @@
 /// 2. Move through the combined sorted support points.
 /// 3. Track the empirical CDF values of both samples.
 /// 4. Accumulate the area between the two CDFs.
-
 pub fn wasserstein_1d(x: &[f64], y: &[f64]) -> f64 {
     // Wasserstein distance is not meaningful if either sample is empty.
     if x.is_empty() || y.is_empty() {
@@ -29,8 +37,49 @@ pub fn wasserstein_1d(x: &[f64], y: &[f64]) -> f64 {
     let mut xs = x.to_vec();
     let mut ys = y.to_vec();
 
-    xs.sort_unstable_by(|a, b| a.total_cmp(b));
-    ys.sort_unstable_by(|a, b| a.total_cmp(b));
+    sort_f64(&mut xs);
+    sort_f64(&mut ys);
+
+    wasserstein_1d_sorted(&xs, &ys)
+}
+
+/// Same as [`wasserstein_1d`], but reusing caller-owned scratch buffers.
+///
+/// Hot loops call this thousands of times in a row; routing them through here
+/// keeps the two sorted copies on buffers that are allocated once instead of
+/// once per call.
+#[inline]
+pub fn wasserstein_1d_with_scratch(
+    x: &[f64],
+    y: &[f64],
+    xs: &mut Vec<f64>,
+    ys: &mut Vec<f64>,
+) -> f64 {
+    if x.is_empty() || y.is_empty() {
+        return f64::NAN;
+    }
+
+    xs.clear();
+    xs.extend_from_slice(x);
+    ys.clear();
+    ys.extend_from_slice(y);
+
+    sort_f64(xs);
+    sort_f64(ys);
+
+    wasserstein_1d_sorted(xs, ys)
+}
+
+/// Core CDF-merge accumulation for two samples that are **already sorted**
+/// ascending under `f64::total_cmp`.
+///
+/// Callers that own their data (bootstrap replicates, incremental split scans)
+/// sort in place and come straight here, skipping the two copies that
+/// [`wasserstein_1d`] has to make.
+pub fn wasserstein_1d_sorted(xs: &[f64], ys: &[f64]) -> f64 {
+    if xs.is_empty() || ys.is_empty() {
+        return f64::NAN;
+    }
 
     // Each observation contributes equal probability mass to its empirical CDF.
     let nx_inv = 1.0 / xs.len() as f64;
@@ -49,15 +98,11 @@ pub fn wasserstein_1d(x: &[f64], y: &[f64]) -> f64 {
     // Accumulated Wasserstein distance.
     let mut dist = 0.0f64;
 
-    while i < xs.len() || j < ys.len() {
-        // Next value from sample x, or infinity if x is exhausted.
-        let next_x = if i < xs.len() { xs[i] } else { f64::INFINITY };
-
-        // Next value from sample y, or infinity if y is exhausted.
-        let next_y = if j < ys.len() { ys[j] } else { f64::INFINITY };
-
+    // Phase 1: both samples still have mass left to place, so each step has to
+    // decide which side jumps next.
+    while i < xs.len() && j < ys.len() {
         // The next support point where at least one empirical CDF jumps.
-        let z = next_x.min(next_y);
+        let z = xs[i].min(ys[j]);
 
         // Between `prev` and `z`, both empirical CDFs are constant.
         //
@@ -83,6 +128,33 @@ pub fn wasserstein_1d(x: &[f64], y: &[f64]) -> f64 {
         }
 
         // Update the previous support point.
+        prev = z;
+    }
+
+    // Phase 2: one sample is exhausted, so every remaining support point comes
+    // from the other one and the branchy two-sided merge is no longer needed.
+    // The other sample's CDF is frozen at its final accumulated value.
+    while i < xs.len() {
+        let z = xs[i];
+        dist += (cdf_x - cdf_y).abs() * (z - prev);
+        cdf_x += nx_inv;
+        i += 1;
+        while i < xs.len() && xs[i] == z {
+            cdf_x += nx_inv;
+            i += 1;
+        }
+        prev = z;
+    }
+
+    while j < ys.len() {
+        let z = ys[j];
+        dist += (cdf_x - cdf_y).abs() * (z - prev);
+        cdf_y += ny_inv;
+        j += 1;
+        while j < ys.len() && ys[j] == z {
+            cdf_y += ny_inv;
+            j += 1;
+        }
         prev = z;
     }
 

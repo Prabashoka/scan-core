@@ -7,12 +7,16 @@ pub fn compute_cp_counts(
     change_points_dict: &BTreeMap<usize, Vec<usize>>,
 ) -> BTreeMap<usize, usize> {
     let mut cp_to_count: BTreeMap<usize, usize> = BTreeMap::new();
+    // One set, cleared per window size, instead of one allocation per window.
+    let mut unique: HashSet<usize> = HashSet::new();
 
     for cps in change_points_dict.values() {
         // A single window size should contribute at most one vote to the same index.
-        let unique: HashSet<usize> = cps.iter().copied().collect();
-        for cp in unique {
-            *cp_to_count.entry(cp).or_insert(0) += 1;
+        unique.clear();
+        for &cp in cps {
+            if unique.insert(cp) {
+                *cp_to_count.entry(cp).or_insert(0) += 1;
+            }
         }
     }
 
@@ -25,55 +29,50 @@ pub fn compute_change_points_with_votes(
     tol: usize,
 ) -> BTreeMap<String, SegmentInfo> {
     let cp_to_count = compute_cp_counts(change_points_dict);
-    let all_cps: Vec<usize> = cp_to_count.keys().copied().collect();
 
-    if all_cps.is_empty() {
+    let mut iter = cp_to_count.iter();
+    let Some((&first_cp, &first_count)) = iter.next() else {
         return BTreeMap::new();
-    }
+    };
 
-    let mut segments: Vec<Vec<usize>> = Vec::new();
-    let mut cur = vec![all_cps[0]];
-
-    for &cp in all_cps.iter().skip(1) {
-        let last_cp = match cur.last() {
-            Some(last_cp) => *last_cp,
-            None => {
-                cur.push(cp);
-                continue;
-            }
-        };
-
-        if cp - last_cp <= tol {
-            cur.push(cp);
-        } else {
-            segments.push(cur);
-            cur = vec![cp];
-        }
-    }
-
-    segments.push(cur);
-
+    // Walk the ascending candidates once, cutting a new segment whenever the
+    // gap to the previous candidate exceeds `tol`. Votes are accumulated in the
+    // same pass, so `cp_to_count` is never looked up again.
     let mut out = BTreeMap::new();
+    let mut segment_index = 1usize;
+    let mut change_points = vec![first_cp];
+    let mut votes = BTreeMap::from([(first_cp, first_count)]);
+    let mut segment_vote = first_count;
+    let mut last_cp = first_cp;
 
-    for (i, seg) in segments.into_iter().enumerate() {
-        let mut votes = BTreeMap::new();
-        let mut segment_vote = 0usize;
-
-        for cp in &seg {
-            let v = *cp_to_count.get(cp).unwrap_or(&0);
-            votes.insert(*cp, v);
-            segment_vote += v;
+    for (&cp, &count) in iter {
+        if cp - last_cp <= tol {
+            change_points.push(cp);
+            votes.insert(cp, count);
+            segment_vote += count;
+        } else {
+            out.insert(
+                format!("segment_{segment_index}"),
+                SegmentInfo {
+                    change_points: std::mem::replace(&mut change_points, vec![cp]),
+                    votes: std::mem::replace(&mut votes, BTreeMap::from([(cp, count)])),
+                    segment_vote,
+                },
+            );
+            segment_index += 1;
+            segment_vote = count;
         }
-
-        out.insert(
-            format!("segment_{}", i + 1),
-            SegmentInfo {
-                change_points: seg,
-                votes,
-                segment_vote,
-            },
-        );
+        last_cp = cp;
     }
+
+    out.insert(
+        format!("segment_{segment_index}"),
+        SegmentInfo {
+            change_points,
+            votes,
+            segment_vote,
+        },
+    );
 
     out
 }
@@ -83,24 +82,17 @@ pub fn leaders_from_segments(segments: &BTreeMap<String, SegmentInfo>) -> BTreeM
     let mut leaders = BTreeMap::new();
 
     for info in segments.values() {
-        let mut best_cp = None::<usize>;
-        let mut best_vote = 0usize;
+        // `votes` is a BTreeMap, so candidates arrive in ascending order: the
+        // first strict maximum is also the lowest-index maximum.
+        let best = info
+            .votes
+            .iter()
+            .fold(None::<(usize, usize)>, |best, (&cp, &vote)| match best {
+                Some((_, best_vote)) if vote <= best_vote => best,
+                _ => Some((cp, vote)),
+            });
 
-        for (&cp, &vote) in &info.votes {
-            let is_better = match best_cp {
-                Some(current_best_cp) => {
-                    vote > best_vote || (vote == best_vote && cp < current_best_cp)
-                }
-                None => true,
-            };
-
-            if is_better {
-                best_cp = Some(cp);
-                best_vote = vote;
-            }
-        }
-
-        if let Some(cp) = best_cp {
+        if let Some((cp, _)) = best {
             // Store the segment-level total vote at the selected representative point.
             leaders.insert(cp, info.segment_vote);
         }

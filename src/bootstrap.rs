@@ -1,9 +1,18 @@
 use crate::stats::PrefixStats;
 use crate::types::ScanRustResult;
-use crate::wasserstein::wasserstein_1d;
+use crate::wasserstein::{sort_f64, wasserstein_1d_sorted};
 use rand::{Rng, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 use rayon::prelude::*;
+
+/// Bootstrap replications are only spread across threads above this count;
+/// below it the coordination costs more than the work saved.
+const PAR_REPS_MIN: usize = 64;
+
+/// Upper bound on the number of tasks one replication sweep is split into.
+/// Replications are individually tiny, so a coarse split keeps scheduling
+/// overhead well under the work being distributed.
+const PAR_REPS_TASKS: usize = 8;
 
 /// Default bootstrap block size used when the user does not provide `b`.
 pub fn default_block_size(m: usize) -> usize {
@@ -32,13 +41,16 @@ pub fn create_taper_window(length: usize, ratio: f64) -> Vec<f64> {
     taper
 }
 
-/// Linear-interpolated percentile after sorting in place.
+/// Linear-interpolated percentile.
+///
+/// Only the one or two order statistics straddling the requested percentile are
+/// needed, so the slice is partitioned around them (`O(n)`) rather than fully
+/// sorted. The slice is still reordered in place; the returned value is
+/// identical to the sort-then-index formulation.
 pub fn percentile_linear(values: &mut [f64], percent: f64) -> f64 {
     if values.is_empty() {
         return f64::NAN;
     }
-
-    values.sort_unstable_by(|a, b| a.total_cmp(b));
 
     let p = percent.clamp(0.0, 100.0) * 0.01;
     let n = values.len();
@@ -51,12 +63,25 @@ pub fn percentile_linear(values: &mut [f64], percent: f64) -> f64 {
     let lo = h.floor() as usize;
     let hi = h.ceil() as usize;
 
+    // After this, `at_lo` holds exactly the element a full sort would place at
+    // index `lo`, and `above` holds the elements a full sort would place after it.
+    let (_, at_lo, above) = values.select_nth_unstable_by(lo, f64::total_cmp);
+    let value_lo = *at_lo;
+
     if lo == hi {
-        values[lo]
-    } else {
-        let weight = h - lo as f64;
-        values[lo].mul_add(1.0 - weight, values[hi] * weight)
+        return value_lo;
     }
+
+    // `hi` is always `lo + 1` here, so the element at `hi` is the smallest of
+    // the upper partition.
+    let value_hi = above
+        .iter()
+        .copied()
+        .reduce(|a, b| if b.total_cmp(&a).is_lt() { b } else { a })
+        .unwrap_or(value_lo);
+
+    let weight = h - lo as f64;
+    value_lo.mul_add(1.0 - weight, value_hi * weight)
 }
 
 /// Deterministically mix seed components so each task gets its own RNG stream.
@@ -69,8 +94,8 @@ pub fn seed_from_parts(seed: u64, start: usize, w: usize, salt: u64) -> u64 {
     x
 }
 
-/// Precomputed taper parameters so they are not recalculated inside the
-/// parallel closure on every bootstrap replication.
+/// Precomputed taper parameters so they are not recalculated for every
+/// bootstrap replication.
 pub struct TaperParams {
     window: Vec<f64>,
     norm_factor: f64,
@@ -88,17 +113,23 @@ impl TaperParams {
     }
 }
 
-/// Generate many tapered-block-bootstrap Wasserstein distances.
+/// Generate many tapered-block-bootstrap Wasserstein distances, writing into a
+/// caller-owned buffer.
+///
+/// Each replication is seeded purely from `(seed, rep_id)`, so replications are
+/// independent and the produced sequence does not depend on how the work is
+/// scheduled — `parallel` changes only the speed, never the output.
 #[allow(clippy::too_many_arguments)]
-pub fn batched_tbb_distances(
+fn tbb_distances_into(
     pooled: &[f64],
     w: usize,
     b_reps: usize,
     block_len: usize,
     taper: &TaperParams,
     seed: u64,
-    batch_size: usize,
-) -> ScanRustResult<Vec<f64>> {
+    parallel: bool,
+    out: &mut Vec<f64>,
+) -> ScanRustResult<()> {
     let n_views = pooled
         .len()
         .checked_sub(block_len)
@@ -110,52 +141,85 @@ pub fn batched_tbb_distances(
     }
 
     let total_len = 2 * w;
-    let k = (total_len + block_len - 1) / block_len;
-    let batch_size = batch_size.max(1);
-    let z_cap = k * block_len;
+    let k = total_len.div_ceil(block_len);
 
-    let mut dists = vec![0.0; b_reps];
+    // One replication: draw `k` tapered blocks, then compare the two halves.
+    let replicate = |z: &mut Vec<f64>, rep_id: usize| -> f64 {
+        let rep_seed = seed_from_parts(seed, rep_id, w, 10_007);
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(rep_seed);
 
-    dists
-        .par_chunks_mut(batch_size)
-        .enumerate()
-        .for_each(|(chunk_id, chunk)| {
-            let base_rep = chunk_id * batch_size;
-
-            // Allocate the bootstrap sample buffer once per Rayon chunk/thread
-            // and reuse it across bootstrap replications.
-            let mut z: Vec<f64> = Vec::with_capacity(z_cap);
-
-            for (offset, out) in chunk.iter_mut().enumerate() {
-                let rep_id = base_rep + offset;
-
-                let rep_seed = seed_from_parts(seed, rep_id, w, 10_007);
-                let mut rng = Xoshiro256PlusPlus::seed_from_u64(rep_seed);
-
-                z.clear();
-
-                for _ in 0..k {
-                    let idx = rng.random_range(0..n_views);
-                    for j in 0..block_len {
-                        z.push(pooled[idx + j] * taper.window[j] * taper.norm_factor);
-                    }
-                }
-
-                z.truncate(total_len);
-
-                // Use the general Wasserstein function. It works for the two
-                // equal-length bootstrap windows without needing a separate
-                // equal-length helper.
-                *out = wasserstein_1d(&z[..w], &z[w..2 * w]);
+        z.clear();
+        for _ in 0..k {
+            // Draw for every block even when the last one is partly unused, so
+            // the RNG stream stays aligned with the replication index.
+            let idx = rng.random_range(0..n_views);
+            // The tail of the final block would be discarded, so never build it.
+            let take = block_len.min(total_len - z.len());
+            let block = &pooled[idx..idx + take];
+            for (&value, &weight) in block.iter().zip(&taper.window[..take]) {
+                z.push(value * weight * taper.norm_factor);
             }
-        });
+        }
 
-    Ok(dists)
+        // `z` is owned scratch, so the halves are sorted in place instead of
+        // being copied into two fresh vectors per replication.
+        let (left, right) = z.split_at_mut(w);
+        sort_f64(left);
+        sort_f64(right);
+        wasserstein_1d_sorted(left, right)
+    };
+
+    out.clear();
+    out.reserve(b_reps);
+
+    if parallel && b_reps >= PAR_REPS_MIN {
+        (0..b_reps)
+            .into_par_iter()
+            .with_min_len(b_reps.div_ceil(PAR_REPS_TASKS))
+            .map_init(|| Vec::with_capacity(total_len), &replicate)
+            // Writes straight into `out`'s spare capacity, in index order.
+            .collect_into_vec(out);
+    } else {
+        let mut z: Vec<f64> = Vec::with_capacity(total_len);
+        out.extend((0..b_reps).map(|rep_id| replicate(&mut z, rep_id)));
+    }
+
+    Ok(())
 }
 
-/// Compute the local tapered block bootstrap detection threshold for one window pair.
+/// Buffers, precomputed taper, and execution policy reused across the splits of
+/// one window size.
+///
+/// The taper depends only on `(block_len, taper_ratio)`, both of which are
+/// constant while scanning a single window size, so it is built once per
+/// window instead of once per threshold evaluation.
+pub struct ThresholdScratch {
+    pooled: Vec<f64>,
+    dists: Vec<f64>,
+    taper: Option<(usize, u64, TaperParams)>,
+    parallel_reps: bool,
+}
+
+impl ThresholdScratch {
+    /// `parallel_reps` spreads each replication sweep across the Rayon pool.
+    /// Callers that already fan out over the pool at a coarser level should
+    /// pass `false`: the nested region then costs more than it saves.
+    pub fn new(parallel_reps: bool) -> Self {
+        Self {
+            pooled: Vec::new(),
+            dists: Vec::new(),
+            taper: None,
+            parallel_reps,
+        }
+    }
+}
+
+/// Compute the local tapered block bootstrap detection threshold for one window
+/// pair, reusing a caller-owned scratch (buffers, cached taper, and the
+/// nested-parallelism policy — see [`ThresholdScratch::new`]).
 #[allow(clippy::too_many_arguments)]
-pub fn compute_tapered_block_bootstrap_threshold(
+pub fn compute_tapered_block_bootstrap_threshold_with(
+    scratch: &mut ThresholdScratch,
     series: &[f64],
     prefix: &PrefixStats,
     start: usize,
@@ -168,7 +232,7 @@ pub fn compute_tapered_block_bootstrap_threshold(
     taper_ratio: f64,
     center: bool,
     eps: f64,
-    batch_size: usize,
+    _batch_size: usize,
 ) -> ScanRustResult<f64> {
     if delta != w {
         return Err("this implementation assumes delta == w".to_string());
@@ -188,30 +252,27 @@ pub fn compute_tapered_block_bootstrap_threshold(
     let left_std_inv = left_std.recip();
     let right_std_inv = right_std.recip();
 
-    let mut pooled: Vec<f64> = Vec::with_capacity(total_len);
+    // Split the scratch fields up front so the buffers can be borrowed
+    // independently below.
+    let ThresholdScratch {
+        pooled,
+        dists,
+        taper: cached_taper,
+        parallel_reps,
+    } = scratch;
+
+    pooled.clear();
+    pooled.reserve(total_len);
+
+    let left = &series[left_start..left_start + w];
+    let right = &series[right_start..right_start + delta];
 
     if center {
-        pooled.extend(
-            series[left_start..left_start + w]
-                .iter()
-                .map(|v| (v - left_mean) * left_std_inv),
-        );
-        pooled.extend(
-            series[right_start..right_start + delta]
-                .iter()
-                .map(|v| (v - right_mean) * right_std_inv),
-        );
+        pooled.extend(left.iter().map(|v| (v - left_mean) * left_std_inv));
+        pooled.extend(right.iter().map(|v| (v - right_mean) * right_std_inv));
     } else {
-        pooled.extend(
-            series[left_start..left_start + w]
-                .iter()
-                .map(|v| v * left_std_inv),
-        );
-        pooled.extend(
-            series[right_start..right_start + delta]
-                .iter()
-                .map(|v| v * right_std_inv),
-        );
+        pooled.extend(left.iter().map(|v| v * left_std_inv));
+        pooled.extend(right.iter().map(|v| v * right_std_inv));
     }
 
     let m = pooled.len();
@@ -220,24 +281,34 @@ pub fn compute_tapered_block_bootstrap_threshold(
         None => default_block_size(m),
     };
 
-    let taper = TaperParams::new(block_len, taper_ratio);
+    let ratio_bits = taper_ratio.to_bits();
+    if !matches!(cached_taper, Some((len, bits, _)) if *len == block_len && *bits == ratio_bits) {
+        *cached_taper = Some((
+            block_len,
+            ratio_bits,
+            TaperParams::new(block_len, taper_ratio),
+        ));
+    }
+    let taper = &cached_taper.as_ref().expect("taper just populated").2;
+
     let bootstrap_seed = seed_from_parts(seed, start, w, 999);
 
-    let mut dists = batched_tbb_distances(
-        &pooled,
+    tbb_distances_into(
+        pooled,
         w,
         b_reps,
         block_len,
-        &taper,
+        taper,
         bootstrap_seed,
-        batch_size,
+        *parallel_reps,
+        dists,
     )?;
 
     // Rescale the standardized bootstrap distances back to the local data scale.
     let local_scale = (0.5 * (left_std.powi(2) + right_std.powi(2))).sqrt();
-    for value in &mut dists {
+    for value in dists.iter_mut() {
         *value *= local_scale;
     }
 
-    Ok(percentile_linear(&mut dists, 100.0 - q_percent))
+    Ok(percentile_linear(dists, 100.0 - q_percent))
 }
