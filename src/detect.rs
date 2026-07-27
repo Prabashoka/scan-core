@@ -253,13 +253,8 @@ pub fn run_scan_detector(
     let prefix = PrefixStats::from_series(&series);
 
     let compute = || -> Vec<ScanRustResult<(usize, WindowScanResult)>> {
-        // Window sizes are the primary fan-out. Letting each of them also
-        // parallelize its bootstrap only pays off when that fan-out cannot fill
-        // the pool on its own; once it can, the nested regions are pure
-        // overhead. Measured on a 16-thread pool: 8 windows run ~2x faster with
-        // nesting, 11 windows run ~2x slower with it.
-        let parallel_bootstrap = window_sizes.len() * 2 <= rayon::current_num_threads();
-
+        // Use both levels of Rayon work sharing: window sizes are independent,
+        // and each window may also distribute its bootstrap replications.
         window_sizes
             .par_iter()
             .map(|&w| {
@@ -276,7 +271,9 @@ pub fn run_scan_detector(
                     taper_ratio,
                     center,
                     batch_size,
-                    parallel_bootstrap,
+                    // Keep bootstrap replication parallelism enabled even
+                    // while the outer window-size scan is also parallel.
+                    true,
                 )
             })
             .collect()
