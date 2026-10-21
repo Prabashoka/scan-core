@@ -6,8 +6,3 @@ During local development, both wrapper projects use this crate through a relativ
 After this directory is published as its own Git repository, replace the path dependencies with
 a pinned Git tag or commit revision.
 
-## Benchmarking
-
-```sh
-cargo run --release --example bench
-```
